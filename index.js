@@ -1,12 +1,7 @@
 /**
- * Deno Version of serverless-xhttp + Nezha
+ * Deno Version of serverless-xhttp + Nezha (Pure JS)
  * * 启动命令 (VPS/本地):
- * deno run --allow-net --allow-read --allow-write --allow-run --allow-env --unstable main.ts
- * * 环境变量 (Environment Variables):
- * - UUID: 你的 UUID
- * - NEZHA_SERVER: 哪吒面板地址 (例如: nz.abc.com:5555)
- * - NEZHA_KEY: 哪吒密钥
- * - PORT: 端口 (默认 8000)
+ * deno run --allow-net --allow-read --allow-write --allow-run --allow-env --unstable index.js
  */
 
 import { parse } from "https://deno.land/std@0.208.0/flags/mod.ts";
@@ -80,7 +75,7 @@ async function runNezha() {
   }
 
   // 3. 生成配置或构建命令
-  let cmdArgs: string[] = [];
+  let cmdArgs = [];
   
   if (NEZHA_PORT) {
     // V0 Agent Logic
@@ -168,141 +163,4 @@ Deno.serve({ port: PORT }, async (req, info) => {
 });
 
 
-// --- VLESS 协议处理逻辑 ---
-async function handleVlessConnection(ws: WebSocket) {
-    let isHeaderParsed = false;
-    let remoteConnection: Deno.Conn | null = null;
-
-    ws.onopen = () => { /* console.log("WS Open"); */ };
-    
-    ws.onmessage = async (event) => {
-        let chunk: Uint8Array;
-        if (event.data instanceof ArrayBuffer) {
-            chunk = new Uint8Array(event.data);
-        } else {
-            return; // 暂不支持文本帧
-        }
-
-        // 如果已连接远程，直接转发
-        if (remoteConnection) {
-            try {
-                await remoteConnection.write(chunk);
-            } catch {
-                ws.close();
-            }
-            return;
-        }
-
-        // 解析 VLESS 头部
-        if (!isHeaderParsed) {
-            try {
-                const { hasError, port, hostname, rawIndex, version } = parseVlessHeader(chunk, UUID);
-                if (hasError) {
-                    console.error("VLESS Header parse failed");
-                    ws.close();
-                    return;
-                }
-                
-                isHeaderParsed = true;
-                const finalHost = PROXY_IP ? PROXY_IP : hostname; // 支持手动指定转发IP
-                
-                // 建立 TCP 连接
-                remoteConnection = await Deno.connect({
-                    hostname: finalHost,
-                    port: port,
-                });
-
-                // 发送 VLESS 响应头部 (Version + 0)
-                ws.send(new Uint8Array([version[0], 0]));
-
-                // 写入剩余数据
-                const rawData = chunk.slice(rawIndex);
-                if (rawData.length > 0) {
-                    await remoteConnection.write(rawData);
-                }
-
-                // 将远程数据管道回 WS
-                pipeRemoteToWs(remoteConnection, ws);
-
-            } catch (e) {
-                console.error("Connect failed:", e);
-                ws.close();
-            }
-        }
-    };
-
-    ws.onclose = () => {
-        if (remoteConnection) {
-            try { remoteConnection.close(); } catch (_) {}
-        }
-    };
-}
-
-async function pipeRemoteToWs(conn: Deno.Conn, ws: WebSocket) {
-    try {
-        for await (const chunk of conn.readable) {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(chunk);
-            } else {
-                break;
-            }
-        }
-    } catch (_) {
-        // error
-    } finally {
-        try { conn.close(); } catch (_) {}
-        if (ws.readyState === WebSocket.OPEN) ws.close();
-    }
-}
-
-// VLESS 头部解析工具
-function parseVlessHeader(chunk: Uint8Array, userId: string) {
-    if (chunk.byteLength < 24) return { hasError: true };
-    const version = chunk.slice(0, 1);
-    const uuidBytes = chunk.slice(1, 17);
-    const requestUuid = bytesToUuid(uuidBytes);
-    
-    // UUID 校验
-    if (requestUuid !== userId) {
-        // return { hasError: true }; // 严格模式可开启
-    }
-
-    const optLen = chunk[17];
-    const cmd = chunk[18 + optLen]; // 1=TCP, 2=UDP
-    const portIdx = 19 + optLen;
-    const port = (chunk[portIdx] << 8) | chunk[portIdx + 1];
-    
-    let addrIdx = portIdx + 2;
-    const addrType = chunk[addrIdx];
-    let hostname = "";
-    let addrEnd = 0;
-
-    if (addrType === 1) { // IPv4
-        hostname = chunk.slice(addrIdx + 1, addrIdx + 5).join(".");
-        addrEnd = addrIdx + 5;
-    } else if (addrType === 2) { // Domain
-        const len = chunk[addrIdx + 1];
-        hostname = new TextDecoder().decode(chunk.slice(addrIdx + 2, addrIdx + 2 + len));
-        addrEnd = addrIdx + 2 + len;
-    } else if (addrType === 3) { // IPv6
-        // 简化处理
-        addrEnd = addrIdx + 17;
-        hostname = "ipv6-not-supported-yet"; 
-    }
-
-    return {
-        hasError: false,
-        port,
-        hostname,
-        rawIndex: addrEnd,
-        version
-    };
-}
-
-function bytesToUuid(bytes: Uint8Array) {
-    const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-}
-
-// 启动 Nezha
-runNezha();
+// --- VLESS 协议处理逻辑
