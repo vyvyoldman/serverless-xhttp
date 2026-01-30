@@ -1,166 +1,195 @@
 /**
- * Deno Version of serverless-xhttp + Nezha (Pure JS)
- * * 启动命令 (VPS/本地):
- * deno run --allow-net --allow-read --allow-write --allow-run --allow-env --unstable index.js
+ * Deno Deploy VLESS (精简稳定版)
+ * 专为 Serverless 环境优化，剔除了文件系统和子进程操作
  */
 
-import { parse } from "https://deno.land/std@0.208.0/flags/mod.ts";
-import { exists } from "https://deno.land/std@0.208.0/fs/exists.ts";
-
-// --- 配置 ---
-const FLAGS = parse(Deno.args);
-const PORT = Number(Deno.env.get("PORT") || Deno.env.get("SERVER_PORT") || FLAGS.port || 8000);
+// --- 1. 全局配置 ---
+const PORT = 8000;
+// 从环境变量获取 UUID，如果没有则使用默认值 (建议在后台设置 UUID 变量)
 const UUID = Deno.env.get("UUID") || "a2056d0d-c98e-4aeb-9aab-37f64edd5710";
-const NEZHA_SERVER = Deno.env.get("NEZHA_SERVER") || "";
-const NEZHA_PORT = Deno.env.get("NEZHA_PORT") || ""; // 哪吒V0端口, V1不需要
-const NEZHA_KEY = Deno.env.get("NEZHA_KEY") || "";
-const SUB_PATH = Deno.env.get("SUB_PATH") || "sub";
-const NAME = Deno.env.get("NAME") || "Deno-Node";
-const PROXY_IP = Deno.env.get("PROXYIP") || ""; // 可选: 转发到的目标IP
+const PROXY_IP = Deno.env.get("PROXYIP") || ""; // 想要转发的优选IP (可选)
+const SUB_PATH = "sub"; // 订阅路径
 
-// 检查是否运行在 Deno Deploy 环境 (无法运行子进程)
-const IS_DEPLOY = Deno.env.get("DENO_DEPLOYMENT_ID") !== undefined;
-
-console.log(`Server starting on port ${PORT}`);
+console.log(`Deno VLESS Server Running...`);
 console.log(`UUID: ${UUID}`);
-console.log(`Environment: ${IS_DEPLOY ? "Deno Deploy (Serverless)" : "VPS/Local (Full)"}`);
 
-// --- Nezha Agent 逻辑 (仅限 VPS/本地) ---
-async function runNezha() {
-  if (IS_DEPLOY) {
-    console.log("Running on Deno Deploy: Nezha Agent skipped (binary execution not allowed).");
-    return;
-  }
+// --- 2. 核心逻辑函数 (先定义，防止报错) ---
 
-  if (!NEZHA_SERVER || !NEZHA_KEY) {
-    console.log("Nezha config missing, skipping agent.");
-    return;
-  }
-
-  const arch = Deno.build.arch;
-  const os = Deno.build.os;
-  
-  if (os !== "linux") {
-    console.log("Nezha agent currently only supports Linux via this script.");
-    return;
-  }
-
-  const fileName = "npm"; // 伪装文件名
-  
-  // 1. 确定下载地址
-  let downloadUrl = "";
-  const domain = arch === "aarch64" ? "arm64.ssss.nyc.mn" : "amd64.ssss.nyc.mn";
-  
-  if (NEZHA_PORT) {
-     // V0 Agent
-     downloadUrl = `https://${domain}/agent`;
-  } else {
-     // V1 Agent
-     downloadUrl = `https://${domain}/v1`;
-  }
-
-  // 2. 下载文件
-  try {
-    if (!await exists(fileName)) {
-      console.log(`Downloading Nezha Agent from ${downloadUrl}...`);
-      const resp = await fetch(downloadUrl);
-      if (!resp.ok) throw new Error(`Download failed: ${resp.statusText}`);
-      const data = await resp.arrayBuffer();
-      await Deno.writeFile(fileName, new Uint8Array(data), { mode: 0o755 });
-      console.log("Nezha Agent downloaded.");
-    }
-  } catch (e) {
-    console.error("Failed to download Nezha:", e);
-    return;
-  }
-
-  // 3. 生成配置或构建命令
-  let cmdArgs = [];
-  
-  if (NEZHA_PORT) {
-    // V0 Agent Logic
-    const tls = ["443", "8443", "2096", "2087", "2083", "2053"].includes(NEZHA_PORT) ? "--tls" : "";
-    cmdArgs = ["-s", `${NEZHA_SERVER}:${NEZHA_PORT}`, "-p", NEZHA_KEY];
-    if (tls) cmdArgs.push("--tls");
-  } else {
-    // V1 Agent Logic
-    // 生成 config.yaml
-    const port = NEZHA_SERVER.includes(":") ? NEZHA_SERVER.split(":")[1] : "80";
-    const isTls = ["443", "8443", "2096", "2087", "2083", "2053"].includes(port);
+/**
+ * 解析 VLESS 协议头部
+ */
+function parseVlessHeader(chunk, userId) {
+    if (chunk.byteLength < 24) return { hasError: true, msg: "Data too short" };
+    const version = chunk[0];
+    // 校验 UUID (这里为了容错，暂时不做强校验，需要的可以加上)
     
-    const configYaml = `
-client_secret: ${NEZHA_KEY}
-server: ${NEZHA_SERVER}
-tls: ${isTls}
-skip_connection_count: true
-skip_procs_count: true
-uuid: ${UUID}
-`;
-    await Deno.writeTextFile("config.yaml", configYaml);
-    cmdArgs = ["-c", "config.yaml"];
-  }
+    const optLen = chunk[17];
+    const cmd = chunk[18 + optLen]; // 1=TCP, 2=UDP
+    
+    if (cmd !== 1) {
+        return { hasError: true, msg: `Unsupported CMD: ${cmd} (Only TCP)` };
+    }
 
-  // 4. 运行
-  console.log("Starting Nezha Agent...");
-  try {
-    const command = new Deno.Command(`./${fileName}`, {
-      args: cmdArgs,
-      stdout: "null",
-      stderr: "null",
-      stdin: "null",
-    });
-    command.spawn(); // 后台运行
-    console.log("Nezha Agent is running.");
-  } catch (e) {
-    console.error("Failed to start Nezha:", e);
-  }
+    const portIdx = 19 + optLen;
+    const port = (chunk[portIdx] << 8) | chunk[portIdx + 1];
+    
+    let addrIdx = portIdx + 2;
+    const addrType = chunk[addrIdx];
+    let hostname = "";
+    let rawIndex = 0;
+
+    if (addrType === 1) { // IPv4
+        hostname = chunk.slice(addrIdx + 1, addrIdx + 5).join(".");
+        rawIndex = addrIdx + 5;
+    } else if (addrType === 2) { // Domain
+        const len = chunk[addrIdx + 1];
+        hostname = new TextDecoder().decode(chunk.slice(addrIdx + 2, addrIdx + 2 + len));
+        rawIndex = addrIdx + 2 + len;
+    } else if (addrType === 3) { // IPv6
+        // Deno Deploy 对 IPv6 支持有限，且代码处理复杂，暂不处理
+        // 大部分情况是 IPv4 或 Domain
+        return { hasError: true, msg: "IPv6 not supported in this lite version" };
+    } else {
+        return { hasError: true, msg: `Unknown address type: ${addrType}` };
+    }
+
+    return { hasError: false, port, hostname, rawIndex, version };
 }
 
-// --- 辅助功能 ---
-async function getMyIP() {
+/**
+ * 将远程 Socket 数据转发回 WebSocket
+ */
+async function pipeRemoteToWs(remote, ws) {
+    const buffer = new Uint8Array(32 * 1024);
     try {
-        const rsp = await fetch("https://api.ip.sb/geoip");
-        const data = await rsp.json();
-        return { ip: data.ip, country: data.country_code, isp: data.isp };
-    } catch {
-        return { ip: "127.0.0.1", country: "XX", isp: "Unknown" };
+        while (true) {
+            const n = await remote.read(buffer);
+            if (n === null) break; // 连接关闭
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(buffer.subarray(0, n));
+            } else {
+                break;
+            }
+        }
+    } catch (e) {
+        // console.error("Pipe Error:", e);
+    } finally {
+        try { remote.close(); } catch (_) {}
+        try { ws.close(); } catch (_) {}
     }
 }
 
-// --- HTTP 服务 & VLESS WebSocket ---
-Deno.serve({ port: PORT }, async (req, info) => {
-  const url = new URL(req.url);
-  const upgrade = req.headers.get("upgrade") || "";
+/**
+ * 处理 WebSocket 连接
+ */
+async function handleVlessConnection(ws) {
+    let isHeaderParsed = false;
+    let remoteConnection = null;
 
-  // 1. 处理 WebSocket (VLESS 核心)
-  if (upgrade.toLowerCase() === "websocket") {
-    // 可选：在这里验证 UUID 路径，例如 /UUID
-    // if (!url.pathname.includes(UUID)) return new Response("Auth fail", { status: 403 });
+    ws.onopen = () => { console.log("[WS] Connected"); };
 
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    handleVlessConnection(socket);
-    return response;
-  }
+    ws.onmessage = async (event) => {
+        const chunk = new Uint8Array(event.data);
 
-  // 2. 处理订阅 /sub
-  if (url.pathname === `/${SUB_PATH}`) {
-    const host = req.headers.get("host") || "localhost";
-    const { ip, country, isp } = await getMyIP();
-    const finalName = NAME ? `${NAME}-${country}` : `Deno-${country}`;
+        // 1. 如果已经建立了连接，直接转发数据
+        if (remoteConnection) {
+            try {
+                await remoteConnection.write(chunk);
+            } catch (e) {
+                console.error("Remote Write Error:", e);
+                ws.close();
+            }
+            return;
+        }
+
+        // 2. 第一次收到数据，解析 VLESS 头部
+        if (!isHeaderParsed) {
+            const res = parseVlessHeader(chunk, UUID);
+            if (res.hasError) {
+                console.error(`[Header Error] ${res.msg}`);
+                ws.close();
+                return;
+            }
+
+            isHeaderParsed = true;
+            // 如果设置了 PROXYIP 环境变量，则强制转发到该 IP
+            const targetHost = PROXY_IP || res.hostname;
+            const targetPort = res.port;
+
+            console.log(`[Connecting] ${res.hostname}:${res.port} -> ${targetHost}`);
+
+            // 限制：Deno Deploy 免费版通常只能连接 80/443 端口
+            try {
+                remoteConnection = await Deno.connect({
+                    hostname: targetHost,
+                    port: targetPort,
+                });
+
+                // VLESS 响应：成功建立连接
+                ws.send(new Uint8Array([res.version, 0]));
+
+                // 将头部携带的多余数据发给远程
+                if (chunk.slice(res.rawIndex).length > 0) {
+                    await remoteConnection.write(chunk.slice(res.rawIndex));
+                }
+
+                // 开始将远程数据转发回 WS
+                pipeRemoteToWs(remoteConnection, ws);
+
+            } catch (e) {
+                console.error(`[Connect Failed] ${targetHost}:${targetPort} - ${e.message}`);
+                ws.close();
+            }
+        }
+    };
+
+    ws.onclose = () => {
+        console.log("[WS] Closed");
+        if (remoteConnection) {
+            try { remoteConnection.close(); } catch (_) {}
+        }
+    };
     
-    // 生成 VLESS WS TLS 链接
-    // 注意：如果是 HTTP 运行（没套 CDN/TLS），security=none。如果套了 CF，security=tls
-    const isTls = host.includes("deno.dev") || PORT === 443;
-    const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2F#${encodeURIComponent(finalName)}`;
-    
-    // 生成 Base64
-    const b64 = btoa(vlessLink);
-    return new Response(b64, { headers: { "Content-Type": "text/plain" } });
-  }
+    ws.onerror = (e) => {
+        console.error("[WS] Error:", e);
+        if (remoteConnection) {
+            try { remoteConnection.close(); } catch (_) {}
+        }
+    };
+}
 
-  // 3. 默认页面
-  return new Response("Deno VLESS Server Running", { status: 200 });
+// --- 3. 启动 Web 服务 ---
+Deno.serve({ port: PORT }, (req) => {
+    const upgrade = req.headers.get("upgrade") || "";
+    const url = new URL(req.url);
+
+    // 情况 A: WebSocket 连接 (VLESS 代理)
+    if (upgrade.toLowerCase() === "websocket") {
+        try {
+            const { socket, response } = Deno.upgradeWebSocket(req);
+            handleVlessConnection(socket);
+            return response;
+        } catch (e) {
+            console.error("WS Upgrade Failed:", e);
+            return new Response("Websocket Upgrade Failed", { status: 500 });
+        }
+    }
+
+    // 情况 B: 获取订阅链接
+    if (url.pathname === `/${SUB_PATH}`) {
+        const host = req.headers.get("host") || "deno-deploy";
+        // 生成 V2RayN 格式的订阅链接
+        // 格式: vless://UUID@HOST:443?security=tls&type=ws&host=HOST&path=/#Name
+        const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2F#Deno-${host.split('.')[0]}`;
+        
+        return new Response(btoa(vlessLink), {
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+    }
+
+    // 情况 C: 默认首页
+    return new Response(`Deno VLESS Server is Running.\nUUID: ${UUID}`, { 
+        status: 200,
+        headers: { "Content-Type": "text/plain" }
+    });
 });
-
-
-// --- VLESS 协议处理逻辑
